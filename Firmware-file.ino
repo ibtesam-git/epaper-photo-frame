@@ -1,0 +1,159 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <SPI.h>
+#include <esp_task_wdt.h>
+#include <GxEPD2_BW.h>
+#include <Adafruit_GFX.h>
+#include <LittleFS.h>
+#include "epaper_page.h"
+
+#define PIN_SPI_SCK   13
+#define PIN_SPI_DIN   14
+#define PIN_SPI_CS    15
+#define PIN_SPI_BUSY  25
+#define PIN_SPI_RST   26
+#define PIN_SPI_DC    27
+
+GxEPD2_BW<GxEPD2_426_GDEQ0426T82, GxEPD2_426_GDEQ0426T82::HEIGHT> display(
+  GxEPD2_426_GDEQ0426T82(PIN_SPI_CS, PIN_SPI_DC, PIN_SPI_RST, PIN_SPI_BUSY));
+
+#define EPD_WIDTH    800
+#define EPD_HEIGHT   480
+const size_t FRAME_SIZE = (EPD_WIDTH * EPD_HEIGHT / 8);
+
+AsyncWebServer server(80);
+DNSServer dnsServer;
+
+// Only ONE image lives in RAM at a time now (~48KB) -
+// the rest sit safely on flash storage until it's their turn.
+uint8_t* frameBuf = nullptr;
+File uploadFile;
+
+int currentIdx = 0;
+int maxActive = 0;
+unsigned long interval = 0; 
+unsigned long lastRun = 0;
+bool timerActive = false;
+
+void resetWDT() { esp_task_wdt_reset(); }
+
+bool loadFrame(int idx) {
+  String path = "/f" + String(idx) + ".bin";
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  if (f.size() != FRAME_SIZE) { f.close(); return false; } // incomplete/corrupt file, skip safely
+  f.read(frameBuf, FRAME_SIZE);
+  f.close();
+  return true;
+}
+
+void drawTurbo(int idx) {
+  if (!loadFrame(idx)) return;
+  resetWDT();
+  display.setFullWindow();
+  display.fillScreen(GxEPD_WHITE);
+  display.drawBitmap(0, 0, frameBuf, EPD_WIDTH, EPD_HEIGHT, GxEPD_BLACK);
+  display.display(false);
+  resetWDT();
+}
+
+void onUpload(AsyncWebServerRequest* r, uint8_t* data, size_t len, size_t index, size_t total) {
+  int idx = 0;
+  if (r->hasParam("idx")) idx = r->getParam("idx")->value().toInt();
+
+  if (index == 0) {
+    if (uploadFile) uploadFile.close();
+    String path = "/f" + String(idx) + ".bin";
+    uploadFile = LittleFS.open(path, "w");
+  }
+  if (uploadFile) uploadFile.write(data, len);
+
+  if (index + len >= total) {
+    if (uploadFile) uploadFile.close();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_task_wdt_config_t twdt_config = {
+        .timeout_ms = 60000,
+        .idle_core_mask = 0,
+        .trigger_panic = false
+    };
+    esp_task_wdt_init(&twdt_config);
+  #else
+    esp_task_wdt_init(60, false);
+  #endif
+  esp_task_wdt_add(NULL);
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed! Check Tools > Partition Scheme has a filesystem.");
+  }
+
+  frameBuf = (uint8_t*)malloc(FRAME_SIZE);
+  if (!frameBuf) {
+    Serial.println("FATAL: could not allocate frame buffer.");
+  }
+
+  SPI.begin(PIN_SPI_SCK, -1, PIN_SPI_DIN, PIN_SPI_CS);
+  
+  display.init(115200, true, 2, false); 
+  display.setRotation(0);
+
+  WiFi.softAP("ePaper-Turbo-Frame", "12345678");
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send_P(200, "text/html", EPAPER_PAGE_HTML); });
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200, "application/json", "{\"state\":\"idle\"}"); });
+  server.on("/upload", HTTP_POST, [](AsyncWebServerRequest* r){ r->send(200); }, NULL, onUpload);
+  
+  server.on("/setMode", HTTP_GET, [](AsyncWebServerRequest* r){
+    String m = r->getParam("m")->value();
+    if(m == "once") {
+      timerActive = false;
+      maxActive = 1;
+      currentIdx = 0;
+      drawTurbo(0);
+    } else {
+      int sec = r->getParam("s")->value().toInt();
+      if (sec < 2) sec = 2;
+      if (sec > 10) sec = 10;
+      interval = (unsigned long)sec * 1000UL;
+      maxActive = r->getParam("c")->value().toInt();
+      timerActive = true;
+      lastRun = millis();
+      currentIdx = 0;
+      drawTurbo(0);
+    }
+    r->send(200);
+  });
+
+  server.on("/clear", HTTP_POST, [](AsyncWebServerRequest* r){
+    timerActive = false;
+    for (int i=0; i<5; i++) {
+      String p = "/f" + String(i) + ".bin";
+      if (LittleFS.exists(p)) LittleFS.remove(p);
+    }
+    maxActive = 0;
+    display.clearScreen();
+    r->send(200);
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* r){ r->redirect("/"); });
+  server.begin();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  resetWDT();
+
+  if (timerActive && maxActive > 0 && (millis() - lastRun > interval)) {
+    lastRun = millis();
+    currentIdx = (currentIdx + 1) % maxActive;
+    drawTurbo(currentIdx);
+  }
+}
